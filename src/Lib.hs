@@ -1,6 +1,7 @@
 {-# LANGUAGE ConstraintKinds  #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase       #-}
+{-# LANGUAGE MultiWayIf       #-}
 {-# LANGUAGE RankNTypes       #-}
 {-# LANGUAGE RecordWildCards  #-}
 {-# LANGUAGE StrictData       #-}
@@ -54,6 +55,15 @@ data OnSignedIntegerOverflow = SIOHalt | WrapAround | Saturate
 data OnDivisionByZero = DBZHalt | ReturnDividend
   deriving (Show, Eq, Ord, Enum, Bounded)
 
+data OnBitwiseShiftByNegative = BSBNHalt | ShiftInOtherDirection
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
+data OnBitwiseShiftTooMuch = BSTMHalt | ShiftAsIfInfinitePrecision | ModuloShiftAmount
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
+data OnBitwiseRightShiftNegative = LogicalShift | ArithmeticShift
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
 data MachineDesc
   = MachineDesc
   { _charBits :: Int
@@ -66,10 +76,13 @@ data MachineDesc
   , _intAddlPaddingBytes :: Int
   , _longAddlPaddingBytes :: Int
   , _longlongAddlPaddingBytes :: Int
+  , _sizetSize :: CIntegralSize
   , _negativeRep :: NegativeRepresentation
   , _onSignedOverflow :: OnSignedIntegerOverflow
   , _onDivByZero :: OnDivisionByZero
-  , _sizetSize :: CIntegralSize
+  , _onShiftByNegative :: OnBitwiseShiftByNegative
+  , _onShiftTooMuch :: OnBitwiseShiftTooMuch
+  , _onRightShiftNegative :: OnBitwiseRightShiftNegative
   }
   deriving (Show, Eq, Ord)
 
@@ -89,6 +102,9 @@ instance Default MachineDesc where
     , _negativeRep = TwosComplement
     , _onSignedOverflow = SIOHalt
     , _onDivByZero = DBZHalt
+    , _onShiftByNegative = BSBNHalt
+    , _onShiftTooMuch = BSTMHalt
+    , _onRightShiftNegative = ArithmeticShift
     }
 
 $(makeLenses ''MachineDesc)
@@ -145,6 +161,8 @@ areAllValuesRepresentableIn md a b =
 data UndefinedBehavior
   = SignedIntegerOverflow
   | DivisionByZero
+  | ShiftByNegative
+  | ShiftTooMuch
   deriving (Show, Eq)
 
 data EvaluationError
@@ -179,7 +197,7 @@ integerConvertType ty v = do
                 p -> if v > tmax
                      then pure (CIntegral ty (v + ((v - tmax) `quot` p + 1) * negate p))
                      else pure (CIntegral ty (v + ((tmin - v) `quot` p + 1) * p))
-  else pure (CIntegral ty (v `mod` snd (representableRange md ty)))
+  else pure (CIntegral ty (v `mod` (1 + snd (representableRange md ty))))
 
 -- | 6.3.1.8 Returns the /common real type/. Note that this type might be
 -- different either of the types because of integer promotion rules.
@@ -247,21 +265,73 @@ cUnaryMinus a = do
   CIntegral ty v <- integerPromotion a
   integerConvertType ty (negate v)
 
-cBinaryPlus, cBinaryMinus, cMult, cDiv, cMod :: Ev m => CIntegral -> CIntegral -> m CIntegral
+cBinaryPlus, cBinaryMinus, cMult, cDiv, cMod, cShiftLeft, cShiftRight :: Ev m => CIntegral -> CIntegral -> m CIntegral
 cBinaryPlus = cSimpleBinaryOp (+)
 cBinaryMinus = cSimpleBinaryOp (-)
+
 cMult = cSimpleBinaryOp (*)
-cDiv = cBinaryOp $ \(ty, a, b) ->
+
+cDivModHandlingZero :: Ev m => (Integer -> Integer -> Integer) -> CIntegral -> CIntegral -> m CIntegral
+cDivModHandlingZero f = cBinaryOp $ \(ty, a, b) ->
   if b == 0
   then
     view onDivByZero >>= \case
       DBZHalt -> throwError (UndefinedBehaviorHalted DivisionByZero)
       ReturnDividend -> integerConvertType ty a
-  else integerConvertType ty (a `quot` b)
-cMod = cBinaryOp $ \(ty, a, b) ->
-  if b == 0
-  then
-    view onDivByZero >>= \case
-      DBZHalt -> throwError (UndefinedBehaviorHalted DivisionByZero)
-      ReturnDividend -> integerConvertType ty a
-  else integerConvertType ty (a `rem` b)
+  else integerConvertType ty (f a b)
+
+cDiv = cDivModHandlingZero quot
+cMod = cDivModHandlingZero rem
+
+cShiftLeft a b = do
+  pa@(CIntegral ty1@(CIntegralType sz _) v1) <- integerPromotion a
+  CIntegral ty2 v2 <- integerPromotion b
+  md <- ask
+  let w = view (sizeToBits sz) md
+  if | v2 < 0 ->
+       view onShiftByNegative >>= \case
+          BSBNHalt -> throwError (UndefinedBehaviorHalted ShiftByNegative)
+          ShiftInOtherDirection -> cShiftRight pa (CIntegral ty2 (negate v2))
+     | fromIntegral v2 >= view (sizeToBits sz) md ->
+        view onShiftTooMuch >>= \case
+          BSTMHalt -> throwError (UndefinedBehaviorHalted ShiftTooMuch)
+          ShiftAsIfInfinitePrecision -> undefined
+          ModuloShiftAmount -> integerConvertType ty1 (v1 `shiftL` (fromIntegral v2 `mod` view (sizeToBits sz) md))
+     | v1 >= 0 -> integerConvertType ty1 (v1 `shiftL` fromIntegral v2)
+     | otherwise ->
+           view negativeRep >>= \case
+             SignMagnitude _ ->
+               let rawShifted = negate v1 `shiftL` fromIntegral v2
+                   signBitSet = testBit rawShifted (w - 1)
+                   masked = rawShifted .&. ((1 `shiftL` (w - 1)) - 1)
+               in integerConvertType ty1 (if signBitSet then negate masked else masked)
+             OnesComplement _ -> undefined
+             TwosComplement -> undefined
+
+cShiftRight a b = do
+  pa@(CIntegral ty1@(CIntegralType sz _) v1) <- integerPromotion a
+  CIntegral ty2 v2 <- integerPromotion b
+  md <- ask
+  let w = view (sizeToBits sz) md
+  if | v2 < 0 ->
+       view onShiftByNegative >>= \case
+         BSBNHalt -> throwError (UndefinedBehaviorHalted ShiftByNegative)
+         ShiftInOtherDirection -> cShiftLeft pa (CIntegral ty2 (negate v2))
+     | fromIntegral v2 >= w ->
+       view onShiftTooMuch >>= \case
+         BSTMHalt -> throwError (UndefinedBehaviorHalted ShiftTooMuch)
+         ShiftAsIfInfinitePrecision -> undefined
+         ModuloShiftAmount -> integerConvertType ty1 (v1 `shiftR` (fromIntegral v2 `mod` view (sizeToBits sz) md))
+     | v1 >= 0 -> integerConvertType ty1 (v1 `shiftR` fromIntegral v2)
+     | otherwise ->
+       view onRightShiftNegative >>= \case
+         LogicalShift ->
+           view negativeRep >>= \case
+             SignMagnitude _ -> integerConvertType ty1 (setBit (negate v1 `shiftR` fromIntegral v2) (w - 1 - fromIntegral v2))
+             OnesComplement _ -> undefined
+             TwosComplement -> undefined
+         ArithmeticShift ->
+           view negativeRep >>= \case
+             SignMagnitude _ -> undefined
+             OnesComplement _ -> integerConvertType ty1 (negate (negate v1 `shiftR` fromIntegral v2))
+             TwosComplement -> integerConvertType ty1 (v1 `shiftR` fromIntegral v2)
