@@ -14,7 +14,9 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Lib
+  exposed-modules:     CMachine.Types
+                     , CMachine.Basic
+                     , CMachine.Operators
   ghc-options:         -Wall -Wextra -Werror
   build-depends:       base >= 4.7 && < 5
                      , lens
