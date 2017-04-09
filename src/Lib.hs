@@ -10,6 +10,7 @@
 
 module Lib where
 
+import           Control.Exception    (assert)
 import           Control.Lens
 import           Control.Monad.Except
 import           Control.Monad.Reader
@@ -283,11 +284,51 @@ cDivModHandlingZero f = cBinaryOp $ \(ty, a, b) ->
 cDiv = cDivModHandlingZero quot
 cMod = cDivModHandlingZero rem
 
+data BitVector
+  = BitVector
+  { bvSize :: Int
+  , bvBits :: Integer
+  } deriving (Show, Eq)
+
+allLowerBitsSet :: Int -> Integer
+allLowerBitsSet w | w >= 0 = (1 `shiftL` w) - 1
+                  | otherwise = 0
+
+toBitVector :: Ev m => CIntegral -> m BitVector
+toBitVector cint = asks $ \md ->
+  let CIntegral (CIntegralType sz _) v = cint
+      w = view (sizeToBits sz) md
+  in case (v >= 0, view negativeRep md) of
+    (True, _) -> BitVector w v
+    (False, TwosComplement) -> BitVector w (v .&. allLowerBitsSet w)
+    (False, OnesComplement _) -> BitVector w ((v + 1) .&. allLowerBitsSet w)
+    (False, SignMagnitude _) -> BitVector w (negate v .|. bit (w - 1))
+
+fromBitVector :: Ev m => CIntegralType -> BitVector -> m CIntegral
+fromBitVector ty@(CIntegralType sz _) (BitVector w v) = asks $ \md -> assert (view (sizeToBits sz) md == w) $
+  let signedType = isSigned md ty
+      negative = signedType && testBit v (w - 1)
+  in case (negative, view negativeRep md) of
+    (False, _) -> CIntegral ty v
+    (True, TwosComplement) -> CIntegral ty (v .|. ((-1) .&. complement (allLowerBitsSet w)))
+    (True, OnesComplement _) -> CIntegral ty (1 + (v .|. ((-1) .&. complement (allLowerBitsSet w))))
+    (True, SignMagnitude _) -> CIntegral ty (negate (clearBit v (w - 1)))
+
+logicalShift :: BitVector -> Int -> BitVector
+logicalShift (BitVector w v) i = BitVector w ((v `shift` i) .&. allLowerBitsSet w)
+
+arithmeticShift :: BitVector -> Int -> BitVector
+arithmeticShift b i
+  | i >= 0 = logicalShiftResult
+  | otherwise = -- sign extend the top i bits
+      let signExtension = allLowerBitsSet w .&. complement (allLowerBitsSet (w - i))
+      in BitVector w (lv .|. signExtension)
+  where logicalShiftResult@(BitVector w lv) = logicalShift b i
+
 cShiftLeft a b = do
   pa@(CIntegral ty1@(CIntegralType sz _) v1) <- integerPromotion a
   CIntegral ty2 v2 <- integerPromotion b
   md <- ask
-  let w = view (sizeToBits sz) md
   if | v2 < 0 ->
        view onShiftByNegative >>= \case
           BSBNHalt -> throwError (UndefinedBehaviorHalted ShiftByNegative)
@@ -297,41 +338,25 @@ cShiftLeft a b = do
           BSTMHalt -> throwError (UndefinedBehaviorHalted ShiftTooMuch)
           ShiftAsIfInfinitePrecision -> undefined
           ModuloShiftAmount -> integerConvertType ty1 (v1 `shiftL` (fromIntegral v2 `mod` view (sizeToBits sz) md))
-     | v1 >= 0 -> integerConvertType ty1 (v1 `shiftL` fromIntegral v2)
-     | otherwise ->
-           view negativeRep >>= \case
-             SignMagnitude _ ->
-               let rawShifted = negate v1 `shiftL` fromIntegral v2
-                   signBitSet = testBit rawShifted (w - 1)
-                   masked = rawShifted .&. ((1 `shiftL` (w - 1)) - 1)
-               in integerConvertType ty1 (if signBitSet then negate masked else masked)
-             OnesComplement _ -> undefined
-             TwosComplement -> undefined
+     | otherwise -> do
+         bv <- toBitVector pa
+         fromBitVector ty1 (bv `logicalShift` fromIntegral v2)
 
 cShiftRight a b = do
   pa@(CIntegral ty1@(CIntegralType sz _) v1) <- integerPromotion a
   CIntegral ty2 v2 <- integerPromotion b
   md <- ask
-  let w = view (sizeToBits sz) md
   if | v2 < 0 ->
        view onShiftByNegative >>= \case
          BSBNHalt -> throwError (UndefinedBehaviorHalted ShiftByNegative)
          ShiftInOtherDirection -> cShiftLeft pa (CIntegral ty2 (negate v2))
-     | fromIntegral v2 >= w ->
+     | fromIntegral v2 >= view (sizeToBits sz) md ->
        view onShiftTooMuch >>= \case
          BSTMHalt -> throwError (UndefinedBehaviorHalted ShiftTooMuch)
          ShiftAsIfInfinitePrecision -> undefined
          ModuloShiftAmount -> integerConvertType ty1 (v1 `shiftR` (fromIntegral v2 `mod` view (sizeToBits sz) md))
-     | v1 >= 0 -> integerConvertType ty1 (v1 `shiftR` fromIntegral v2)
-     | otherwise ->
-       view onRightShiftNegative >>= \case
-         LogicalShift ->
-           view negativeRep >>= \case
-             SignMagnitude _ -> integerConvertType ty1 (setBit (negate v1 `shiftR` fromIntegral v2) (w - 1 - fromIntegral v2))
-             OnesComplement _ -> undefined
-             TwosComplement -> undefined
-         ArithmeticShift ->
-           view negativeRep >>= \case
-             SignMagnitude _ -> undefined
-             OnesComplement _ -> integerConvertType ty1 (negate (negate v1 `shiftR` fromIntegral v2))
-             TwosComplement -> integerConvertType ty1 (v1 `shiftR` fromIntegral v2)
+     | otherwise -> do
+         bv <- toBitVector pa
+         view onRightShiftNegative >>= \case
+           LogicalShift -> fromBitVector ty1 (bv `logicalShift` negate (fromIntegral v2))
+           ArithmeticShift -> fromBitVector ty1 (bv `arithmeticShift` negate (fromIntegral v2))
