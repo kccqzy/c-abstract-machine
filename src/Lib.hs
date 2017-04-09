@@ -174,7 +174,11 @@ integerConvertType ty v = do
           case view onSignedOverflow md of
             SIOHalt -> throwError (UndefinedBehaviorHalted SignedIntegerOverflow)
             Saturate -> pure (CIntegral ty (if v > tmax then tmax else tmin))
-            WrapAround -> undefined
+            WrapAround ->
+              case tmax - tmin + 1 of
+                p -> if v > tmax
+                     then pure (CIntegral ty (v + ((v - tmax) `quot` p + 1) * negate p))
+                     else pure (CIntegral ty (v + ((tmin - v) `quot` p + 1) * p))
   else pure (CIntegral ty (v `mod` snd (representableRange md ty)))
 
 -- | 6.3.1.8 Returns the /common real type/. Note that this type might be
