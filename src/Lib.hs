@@ -217,3 +217,18 @@ cSizeofOnType ty = do
   v <- sizeof ty
   sz <- view sizetSize
   pure $ CIntegral (CIntegralType sz Unsigned) (fromIntegral v)
+
+cBinaryOp :: Ev m => (Integer -> Integer -> Integer) -> CIntegral -> CIntegral -> m CIntegral
+cBinaryOp f a b = do
+  (ty, v1, v2) <- usualArithmeticConversion a b
+  integerConvertType ty (f v1 v2)
+
+cUnaryPlus, cUnaryMinus :: Ev m => CIntegral -> m CIntegral
+cUnaryPlus = integerPromotion
+cUnaryMinus a = do
+  CIntegral ty v <- integerPromotion a
+  integerConvertType ty (negate v)
+
+cBinaryPlus, cBinaryMinus :: Ev m => CIntegral -> CIntegral -> m CIntegral
+cBinaryPlus = cBinaryOp (+)
+cBinaryMinus = cBinaryOp (-)
