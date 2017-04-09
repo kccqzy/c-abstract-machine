@@ -1,5 +1,6 @@
 {-# LANGUAGE ConstraintKinds  #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase       #-}
 {-# LANGUAGE RankNTypes       #-}
 {-# LANGUAGE RecordWildCards  #-}
 {-# LANGUAGE StrictData       #-}
@@ -50,6 +51,9 @@ unsigned = CIntegralType CInt Unsigned
 data OnSignedIntegerOverflow = SIOHalt | WrapAround | Saturate
   deriving (Show, Eq, Ord, Enum, Bounded)
 
+data OnDivisionByZero = DBZHalt | ReturnDividend
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
 data MachineDesc
   = MachineDesc
   { _charBits :: Int
@@ -64,6 +68,7 @@ data MachineDesc
   , _longlongAddlPaddingBytes :: Int
   , _negativeRep :: NegativeRepresentation
   , _onSignedOverflow :: OnSignedIntegerOverflow
+  , _onDivByZero :: OnDivisionByZero
   , _sizetSize :: CIntegralSize
   }
   deriving (Show, Eq, Ord)
@@ -83,6 +88,7 @@ instance Default MachineDesc where
     , _charSigned = True
     , _negativeRep = TwosComplement
     , _onSignedOverflow = SIOHalt
+    , _onDivByZero = DBZHalt
     }
 
 $(makeLenses ''MachineDesc)
@@ -136,8 +142,13 @@ areAllValuesRepresentableIn md a b =
 
 -- * Evaluation and operators
 
+data UndefinedBehavior
+  = SignedIntegerOverflow
+  | DivisionByZero
+  deriving (Show, Eq)
+
 data EvaluationError
-  = UndefinedBehaviorHalted
+  = UndefinedBehaviorHalted UndefinedBehavior
   deriving (Show, Eq)
 
 type Ev m = (MonadReader MachineDesc m, MonadError EvaluationError m)
@@ -161,7 +172,7 @@ integerConvertType ty v = do
         if tmin <= v && v <= tmax then pure (CIntegral ty v)
         else
           case view onSignedOverflow md of
-            SIOHalt -> throwError UndefinedBehaviorHalted
+            SIOHalt -> throwError (UndefinedBehaviorHalted SignedIntegerOverflow)
             Saturate -> pure (CIntegral ty (if v > tmax then tmax else tmin))
             WrapAround -> undefined
   else pure (CIntegral ty (v `mod` snd (representableRange md ty)))
@@ -218,8 +229,11 @@ cSizeofOnType ty = do
   sz <- view sizetSize
   pure $ CIntegral (CIntegralType sz Unsigned) (fromIntegral v)
 
-cBinaryOp :: Ev m => (Integer -> Integer -> Integer) -> CIntegral -> CIntegral -> m CIntegral
-cBinaryOp f a b = do
+cBinaryOp :: Ev m =>((CIntegralType, Integer, Integer) -> m CIntegral) -> CIntegral -> CIntegral -> m CIntegral
+cBinaryOp f a b = usualArithmeticConversion a b >>= f
+
+cSimpleBinaryOp :: Ev m => (Integer -> Integer -> Integer) -> CIntegral -> CIntegral -> m CIntegral
+cSimpleBinaryOp f a b = do
   (ty, v1, v2) <- usualArithmeticConversion a b
   integerConvertType ty (f v1 v2)
 
@@ -229,6 +243,21 @@ cUnaryMinus a = do
   CIntegral ty v <- integerPromotion a
   integerConvertType ty (negate v)
 
-cBinaryPlus, cBinaryMinus :: Ev m => CIntegral -> CIntegral -> m CIntegral
-cBinaryPlus = cBinaryOp (+)
-cBinaryMinus = cBinaryOp (-)
+cBinaryPlus, cBinaryMinus, cMult, cDiv, cMod :: Ev m => CIntegral -> CIntegral -> m CIntegral
+cBinaryPlus = cSimpleBinaryOp (+)
+cBinaryMinus = cSimpleBinaryOp (-)
+cMult = cSimpleBinaryOp (*)
+cDiv = cBinaryOp $ \(ty, a, b) ->
+  if b == 0
+  then
+    view onDivByZero >>= \case
+      DBZHalt -> throwError (UndefinedBehaviorHalted DivisionByZero)
+      ReturnDividend -> integerConvertType ty a
+  else integerConvertType ty (a `quot` b)
+cMod = cBinaryOp $ \(ty, a, b) ->
+  if b == 0
+  then
+    view onDivByZero >>= \case
+      DBZHalt -> throwError (UndefinedBehaviorHalted DivisionByZero)
+      ReturnDividend -> integerConvertType ty a
+  else integerConvertType ty (a `rem` b)
