@@ -63,6 +63,9 @@ data OnBitwiseShiftTooMuch = BSTMHalt | ShiftAsIfInfinitePrecision | ModuloShift
 data OnBitwiseRightShiftNegative = LogicalShift | ArithmeticShift
   deriving (Show, Eq, Ord, Enum, Bounded)
 
+data OnBitwiseLeftShiftNegative = BLSNHalt | JustShift
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
 data MachineDesc
   = MachineDesc
   { _charBits :: Int
@@ -82,6 +85,7 @@ data MachineDesc
   , _onShiftByNegative :: OnBitwiseShiftByNegative
   , _onShiftTooMuch :: OnBitwiseShiftTooMuch
   , _onRightShiftNegative :: OnBitwiseRightShiftNegative
+  , _onLeftShiftNegative :: OnBitwiseLeftShiftNegative
   }
   deriving (Show, Eq, Ord)
 
@@ -104,6 +108,7 @@ instance Default MachineDesc where
     , _onShiftByNegative = BSBNHalt
     , _onShiftTooMuch = BSTMHalt
     , _onRightShiftNegative = ArithmeticShift
+    , _onLeftShiftNegative = BLSNHalt
     }
 
 $(makeLenses ''MachineDesc)
@@ -113,6 +118,7 @@ data UndefinedBehavior
   | DivisionByZero
   | ShiftByNegative
   | ShiftTooMuch
+  | LeftShiftNegative
   deriving (Show, Eq)
 
 data EvaluationError

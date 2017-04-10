@@ -138,9 +138,10 @@ cShiftLeft a b = do
           BSTMHalt -> throwError (UndefinedBehaviorHalted ShiftTooMuch)
           ShiftAsIfInfinitePrecision -> undefined
           ModuloShiftAmount -> integerConvertType ty1 (v1 `shiftL` (fromIntegral v2 `mod` view (sizeToBits sz) md))
-     | otherwise -> do
+     | view onLeftShiftNegative md == JustShift || v1 >= 0 -> do
          bv <- toBitVector pa
          fromBitVector ty1 (bv `logicalShift` fromIntegral v2)
+     | otherwise -> throwError (UndefinedBehaviorHalted LeftShiftNegative)
 
 cShiftRight :: Ev m => CIntegral -> CIntegral -> m CIntegral
 cShiftRight a b = do
